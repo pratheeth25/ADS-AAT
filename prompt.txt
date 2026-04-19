@@ -1,0 +1,6 @@
+YEah The comparision dashboard is good and needs no changes 
+but real time visualization needs changes 
+1. When I Insert the value it should automatically update the json 
+and it should reflect in streamlit app or refresh button should be present
+2. CHange the implementation bcz PDL and DAta layer are same 
+and for large no of insertions make multiple coil layers 
