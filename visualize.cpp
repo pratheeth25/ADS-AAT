@@ -3,6 +3,37 @@
 // Auto-exports structure.json after each mutation for Streamlit sync
 // PDL = Position Descriptor Layer (metadata/index), Data = actual values
 // Multi-coil ESL with 4 COIL levels for scalability
+//
+// ============================================================
+// ACADEMIC REFERENCE
+// ============================================================
+// This file implements the ESL (Express Skiplist) data structure
+// proposed in:
+//
+//   Na, Y., Koo, B., Park, T., Park, J., & Kim, W.-H. (2023).
+//   "ESL: A High-Performance Skiplist with Express Lane."
+//   Applied Sciences, 13(17), 9925.
+//   DOI: https://doi.org/10.3390/app13179925
+//   URL: https://www.mdpi.com/2076-3417/13/17/9925
+//
+// The traditional skiplist baseline follows:
+//   Pugh, W. (1990). "Skip Lists: A Probabilistic Alternative
+//   to Balanced Trees." Commun. ACM, 33, 668-676.
+//   DOI: https://doi.org/10.1145/78973.78977
+//
+// The ROWEX concurrency protocol is from:
+//   Leis, V., Scheibner, F., Kemper, A., & Neumann, T. (2016).
+//   "The ART of Practical Synchronization."
+//   DaMoN Workshop, pp. 3:1-3:8.
+//
+// MODIFICATIONS from the paper:
+//   - COIL uses sorted std::vector with binary search instead of
+//     contiguous array with exponential+linear search.
+//   - PDL stores {key, data_pos} references into the sorted Data
+//     array for range-narrowing during search.
+//   - Exports structure.json after every mutation for Streamlit sync.
+//   - Interactive CLI not present in the original paper.
+// ============================================================
 
 #include <iostream>
 #include <vector>

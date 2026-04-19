@@ -1,6 +1,38 @@
 // benchmark.cpp — Traditional Skiplist vs ESL (Express Skiplist) Benchmark
 // Runs 100,000 operations (50% insert, 50% search), measures detailed metrics,
 // prints a console dashboard, and exports benchmark_results.json.
+//
+// ============================================================
+// ACADEMIC REFERENCE
+// ============================================================
+// This file implements the ESL (Express Skiplist) data structure
+// proposed in:
+//
+//   Na, Y., Koo, B., Park, T., Park, J., & Kim, W.-H. (2023).
+//   "ESL: A High-Performance Skiplist with Express Lane."
+//   Applied Sciences, 13(17), 9925.
+//   DOI: https://doi.org/10.3390/app13179925
+//   URL: https://www.mdpi.com/2076-3417/13/17/9925
+//
+// The traditional skiplist baseline follows:
+//   Pugh, W. (1990). "Skip Lists: A Probabilistic Alternative
+//   to Balanced Trees." Commun. ACM, 33, 668-676.
+//   DOI: https://doi.org/10.1145/78973.78977
+//
+// The ROWEX concurrency protocol is from:
+//   Leis, V., Scheibner, F., Kemper, A., & Neumann, T. (2016).
+//   "The ART of Practical Synchronization."
+//   DaMoN Workshop, pp. 3:1-3:8.
+//
+// MODIFICATIONS from the paper:
+//   - COIL implemented as sorted std::vector (binary search) instead
+//     of contiguous array with exponential+linear search.
+//   - PDL stores {key, data_pos} position hints into the Data array
+//     (combines paper's PDL with a learned-index-style position hint).
+//   - BG thread uses mutex+condvar op-log; full sort via waitForBG()
+//     instead of per-insert CAS-based lock-free insertion.
+//   - No epoch-based memory reclamation (educational scope).
+// ============================================================
 
 #include <iostream>
 #include <vector>

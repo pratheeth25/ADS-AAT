@@ -1,3 +1,32 @@
+# app.py — Streamlit dashboard: ESL vs Traditional Skiplist
+#
+# ============================================================
+# ACADEMIC REFERENCE
+# ============================================================
+# This dashboard visualises the ESL (Express Skiplist) data structure
+# proposed in:
+#
+#   Na, Y., Koo, B., Park, T., Park, J., & Kim, W.-H. (2023).
+#   "ESL: A High-Performance Skiplist with Express Lane."
+#   Applied Sciences, 13(17), 9925.
+#   DOI: https://doi.org/10.3390/app13179925
+#   URL: https://www.mdpi.com/2076-3417/13/17/9925
+#
+# The traditional skiplist baseline follows:
+#   Pugh, W. (1990). "Skip Lists: A Probabilistic Alternative
+#   to Balanced Trees." Commun. ACM, 33, 668-676.
+#   DOI: https://doi.org/10.1145/78973.78977
+#
+# MODIFICATIONS from the paper:
+#   - COIL uses sorted Python lists with bisect (binary search)
+#     instead of contiguous arrays with exponential+linear search.
+#   - PDL stores {key, data_pos} position hints into the Data list
+#     for range-narrowing; rebuilt after every insert/delete.
+#   - Real-time Streamlit visualization is our addition (not in paper).
+#   - JSON state persistence (structure.json, op_log.json) for
+#     CLI <-> dashboard synchronization is our addition.
+# ============================================================
+
 import streamlit as st
 import json
 import os
