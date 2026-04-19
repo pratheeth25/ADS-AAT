@@ -4,3 +4,8 @@ __pycache__/
 
 # Streamlit config
 .streamlit/
+
+*.exe
+
+*.json
+
