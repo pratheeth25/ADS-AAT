@@ -34,13 +34,219 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
+import bisect
+import math
+import time as _time
+import datetime as _dt
+from random import Random
 pio.templates.default = "plotly_dark"
+
+_rng = Random()
+NUM_COIL_LEVELS = 4
+
+# ── File I/O helpers (module-level — available in all tabs) ──────────────
+def _save_struct(s):
+    with open("structure.json", "w") as f:
+        json.dump(s, f, indent=2)
+
+def _load_struct_disk():
+    try:
+        with open("structure.json", "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_oplog(log):
+    with open("op_log.json", "w") as f:
+        json.dump(log, f)
+
+def _load_oplog():
+    try:
+        with open("op_log.json", "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _save_traverse_log(tlog):
+    with open("traverse_logs.json", "w") as f:
+        json.dump(tlog, f, indent=2)
+
+def _load_traverse_log():
+    try:
+        with open("traverse_logs.json", "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"forward": [], "backward": []}
+
+# ── Data-structure functions (module-level — available in all tabs) ───────
+def normalize_esl(esl_data):
+    """Fix old PDL format (identical to data) and ensure multi-coil layers."""
+    pdl = esl_data.get("pdl", [])
+    data = esl_data.get("data", [])
+    coil = esl_data.get("coil", [])
+    while len(coil) < NUM_COIL_LEVELS:
+        coil.insert(0, [])
+    if pdl and isinstance(pdl[0], (int, float)):
+        if sorted(pdl) == sorted(data):
+            step = max(1, len(data) // max(1, len(data) // 2))
+            sampled = list(dict.fromkeys(data[::step] + ([data[-1]] if data else [])))
+            pdl = [{"key": k, "data_pos": bisect.bisect_left(data, k)} for k in sorted(sampled)]
+        else:
+            pdl = [{"key": k, "data_pos": bisect.bisect_left(data, k)} for k in sorted(pdl)]
+    esl_data["pdl"] = pdl
+    esl_data["coil"] = coil
+    return esl_data
+
+def insert_traditional(levels, key):
+    """Insert key into traditional skiplist (array-of-levels representation)."""
+    if not levels:
+        levels.append([])
+    max_level = 0
+    while _rng.random() < 0.25 and max_level < 15:
+        max_level += 1
+    while len(levels) - 1 < max_level:
+        levels.insert(0, [])
+    for i in range(max_level + 1):
+        bisect.insort(levels[len(levels) - 1 - i], key)
+    return levels
+
+def insert_esl(esl_data, key):
+    """Insert key into ESL with proper PDL/Data separation and multi-coil."""
+    data = esl_data["data"]
+    pdl = esl_data["pdl"]
+    coil = esl_data["coil"]
+    bisect.insort(data, key)
+    if _rng.random() < 0.4:
+        pos = bisect.bisect_left(data, key)
+        pdl.append({"key": key, "data_pos": pos})
+        pdl.sort(key=lambda x: x["key"])
+    n = len(coil)
+    # Hierarchical promotion: start from L0 (densest/bottom), roll p=0.25 each level.
+    # Stop at the first failure. A key promoted to Lk appears in L0..Lk (all lower levels too).
+    # coil[0] = L0 (densest, ~25% of keys), coil[n-1] = Ln-1 (sparsest, ~(0.25^n)% of keys)
+    max_lvl = -1
+    for i in range(n):
+        if _rng.random() < 0.25:
+            max_lvl = i
+        else:
+            break
+    if max_lvl >= 0:
+        for i in range(max_lvl + 1):
+            bisect.insort(coil[i], key)
+    for entry in pdl:
+        entry["data_pos"] = bisect.bisect_left(data, entry["key"])
+    return esl_data
+
+def delete_traditional(levels, key):
+    """Remove key from every level of the traditional skiplist."""
+    for lvl in levels:
+        try:
+            lvl.remove(key)
+        except ValueError:
+            pass
+    while len(levels) > 1 and not levels[0]:
+        levels.pop(0)
+    return levels
+
+def delete_esl(esl_data, key):
+    """Remove key from ESL data layer, PDL, and all COIL levels."""
+    data = esl_data["data"]
+    pdl  = esl_data["pdl"]
+    coil = esl_data["coil"]
+    try:
+        data.remove(key)
+    except ValueError:
+        pass
+    esl_data["pdl"] = [e for e in pdl if e["key"] != key]
+    for lvl in coil:
+        try:
+            lvl.remove(key)
+        except ValueError:
+            pass
+    for entry in esl_data["pdl"]:
+        entry["data_pos"] = bisect.bisect_left(data, entry["key"])
+    return esl_data
+
+def search_traditional(levels, key):
+    """Traditional skiplist search: linear scan at each level (top-down)."""
+    comparisons = 0
+    steps = 0
+    path = []
+    for level_idx, lvl in enumerate(levels):
+        level_num = len(levels) - 1 - level_idx
+        steps += 1
+        for i, val in enumerate(lvl):
+            comparisons += 1
+            if val == key:
+                path.append({"level": f"Level {level_num}", "action": f"Found {key} after {i+1} scans", "hit": True})
+                return True, comparisons, steps, path
+            elif val > key:
+                path.append({"level": f"Level {level_num}", "action": f"Scanned {i+1} nodes, drop down"})
+                break
+        else:
+            path.append({"level": f"Level {level_num}", "action": f"Scanned {len(lvl)} nodes, drop down"})
+    return False, comparisons, steps, path
+
+def search_esl(esl_data, key):
+    """ESL search: binary search with range narrowing through COIL -> PDL -> Data."""
+    data = esl_data["data"]
+    pdl = esl_data["pdl"]
+    coil = esl_data["coil"]
+    comparisons = 0
+    steps = 0
+    path = []
+    if not data:
+        return False, 0, 0, [{"level": "Data", "action": "Empty", "hit": False}]
+    lo, hi = 0, len(data) - 1
+    # Traverse COIL from sparsest (highest index) to densest (lowest index = L0)
+    for level_idx in range(len(coil) - 1, -1, -1):
+        lvl = coil[level_idx]
+        level_num = level_idx
+        if not lvl:
+            continue
+        steps += 1
+        bs_comps = max(1, math.ceil(math.log2(max(len(lvl), 2))))
+        comparisons += bs_comps
+        idx = bisect.bisect_left(lvl, key)
+        if idx < len(lvl) and lvl[idx] == key:
+            path.append({"level": f"COIL L{level_num}", "action": f"HIT {key} ({bs_comps} comps)", "hit": True})
+            return True, comparisons, steps, path
+        if idx > 0:
+            lo = max(lo, bisect.bisect_left(data, lvl[idx - 1]))
+        if idx < len(lvl):
+            hi = min(hi, bisect.bisect_left(data, lvl[idx]))
+        path.append({"level": f"COIL L{level_num}", "action": f"Narrow [{lo},{hi}] ({bs_comps} comps)"})
+    if pdl:
+        pdl_keys = [e["key"] for e in pdl]
+        steps += 1
+        bs_comps = max(1, math.ceil(math.log2(max(len(pdl_keys), 2))))
+        comparisons += bs_comps
+        idx = bisect.bisect_left(pdl_keys, key)
+        if idx < len(pdl_keys) and pdl_keys[idx] == key:
+            path.append({"level": "PDL", "action": f"HIT {key} ({bs_comps} comps)", "hit": True})
+            return True, comparisons, steps, path
+        if idx > 0:
+            lo = max(lo, bisect.bisect_left(data, pdl_keys[idx - 1]))
+        if idx < len(pdl_keys):
+            hi = min(hi, bisect.bisect_left(data, pdl_keys[idx]))
+        path.append({"level": "PDL", "action": f"Narrow [{lo},{hi}] ({bs_comps} comps)"})
+    sub = data[lo:hi + 1]
+    n = max(len(sub), 1)
+    bs_comps = max(1, math.ceil(math.log2(max(n, 2))))
+    comparisons += bs_comps
+    steps += 1
+    idx = bisect.bisect_left(sub, key)
+    if idx < len(sub) and sub[idx] == key:
+        path.append({"level": "Data", "action": f"Found at pos {lo + idx} ({bs_comps} comps)", "hit": True})
+        return True, comparisons, steps, path
+    path.append({"level": "Data", "action": f"Not found ({bs_comps} comps)"})
+    return False, comparisons, steps, path
 
 st.set_page_config(page_title="ESL vs Traditional Skiplist", layout="wide")
 
 # ── Sidebar ──────────────────────────────────────────────
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Select Tab", ["Performance (3 Scales)", "Structure Visualization", "Thread & BG Logs"])
+page = st.sidebar.radio("Select Tab", ["Performance (3 Scales)", "Structure Visualization", "Thread & BG Logs", "Practical API Demo"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("Upload JSON")
@@ -208,235 +414,6 @@ if page == "Performance (3 Scales)":
 elif page == "Structure Visualization":
     st.title("ESL vs Traditional Skiplist - Real-Time Visualization")
 
-    import bisect, math, time as _time
-    from random import Random
-    _rng = Random()
-
-    NUM_COIL_LEVELS = 4
-
-    # ── Helper Functions ──────────────────────────────────
-
-    def _save_struct(s):
-        with open("structure.json", "w") as f:
-            json.dump(s, f, indent=2)
-
-    def _load_struct_disk():
-        try:
-            with open("structure.json", "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    def _save_oplog(log):
-        with open("op_log.json", "w") as f:
-            json.dump(log, f)
-
-    def _load_oplog():
-        try:
-            with open("op_log.json", "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-
-    def normalize_esl(esl_data):
-        """Fix old PDL format (identical to data) and ensure multi-coil layers."""
-        pdl = esl_data.get("pdl", [])
-        data = esl_data.get("data", [])
-        coil = esl_data.get("coil", [])
-
-        # Ensure enough coil levels (stored top-to-bottom)
-        while len(coil) < NUM_COIL_LEVELS:
-            coil.insert(0, [])
-
-        # Convert old PDL format: list of ints → list of {"key", "data_pos"}
-        if pdl and isinstance(pdl[0], (int, float)):
-            if sorted(pdl) == sorted(data):
-                # PDL identical to Data -> sample ~50% as index anchors
-                step = max(1, len(data) // max(1, len(data) // 2))
-                sampled = list(dict.fromkeys(data[::step] + ([data[-1]] if data else [])))
-                pdl = [{"key": k, "data_pos": bisect.bisect_left(data, k)} for k in sorted(sampled)]
-            else:
-                pdl = [{"key": k, "data_pos": bisect.bisect_left(data, k)} for k in sorted(pdl)]
-
-        esl_data["pdl"] = pdl
-        esl_data["coil"] = coil
-        return esl_data
-
-    def insert_traditional(levels, key):
-        """Insert key into traditional skiplist (array-of-levels representation)."""
-        if not levels:
-            levels.append([])
-        max_level = 0
-        # p=0.25 (standard Pugh skiplist) -> ~log4(n) levels
-        while _rng.random() < 0.25 and max_level < 15:
-            max_level += 1
-        while len(levels) - 1 < max_level:
-            levels.insert(0, [])
-        for i in range(max_level + 1):
-            bisect.insort(levels[len(levels) - 1 - i], key)
-        return levels
-
-    def insert_esl(esl_data, key):
-        """Insert key into ESL with proper PDL/Data separation and multi-coil."""
-        data = esl_data["data"]
-        pdl = esl_data["pdl"]
-        coil = esl_data["coil"]
-
-        # 1. Always insert into Data layer (sorted)
-        bisect.insort(data, key)
-
-        # 2. Probabilistic promotion to PDL (~40% - NOT all keys)
-        if _rng.random() < 0.4:
-            pos = bisect.bisect_left(data, key)
-            pdl.append({"key": key, "data_pos": pos})
-            pdl.sort(key=lambda x: x["key"])
-
-        # 3. Hierarchical multi-coil promotion
-        # Roll once to determine max level; insert into all levels 0..maxLvl
-        # coil[0] = highest/sparsest, coil[-1] = lowest/densest
-        # Stored top-to-bottom: coil[-1]=L0 (densest), coil[0]=L3 (sparsest)
-        n = len(coil)
-        max_lvl = -1
-        for i in range(n):
-            level_from_bottom = n - 1 - i  # coil[n-1]=L0, coil[0]=L3
-            if _rng.random() < 0.25:
-                max_lvl = level_from_bottom
-            else:
-                break
-        # Insert into all coil levels from L0 up to max_lvl
-        if max_lvl >= 0:
-            for i in range(n):
-                level_from_bottom = n - 1 - i
-                if level_from_bottom <= max_lvl:
-                    bisect.insort(coil[i], key)
-
-        # 4. Rebuild PDL position references (shifted after data insert)
-        for entry in pdl:
-            entry["data_pos"] = bisect.bisect_left(data, entry["key"])
-
-        return esl_data
-
-    def delete_traditional(levels, key):
-        """Remove key from every level of the traditional skiplist."""
-        for lvl in levels:
-            try:
-                lvl.remove(key)
-            except ValueError:
-                pass
-        # Drop empty levels from the top (except always keep at least one)
-        while len(levels) > 1 and not levels[0]:
-            levels.pop(0)
-        return levels
-
-    def delete_esl(esl_data, key):
-        """Remove key from ESL data layer, PDL, and all COIL levels."""
-        data = esl_data["data"]
-        pdl  = esl_data["pdl"]
-        coil = esl_data["coil"]
-
-        # Remove from Data
-        try:
-            data.remove(key)
-        except ValueError:
-            pass
-
-        # Remove from PDL
-        esl_data["pdl"] = [e for e in pdl if e["key"] != key]
-
-        # Remove from every COIL level
-        for lvl in coil:
-            try:
-                lvl.remove(key)
-            except ValueError:
-                pass
-
-        # Rebuild PDL position references after data deletion
-        for entry in esl_data["pdl"]:
-            entry["data_pos"] = bisect.bisect_left(data, entry["key"])
-
-        return esl_data
-
-    def search_traditional(levels, key):
-        """Traditional skiplist search: linear scan at each level (top-down)."""
-        comparisons = 0
-        steps = 0
-        path = []
-        for level_idx, lvl in enumerate(levels):
-            level_num = len(levels) - 1 - level_idx
-            steps += 1
-            for i, val in enumerate(lvl):
-                comparisons += 1
-                if val == key:
-                    path.append({"level": f"Level {level_num}", "action": f"Found {key} after {i+1} scans", "hit": True})
-                    return True, comparisons, steps, path
-                elif val > key:
-                    path.append({"level": f"Level {level_num}", "action": f"Scanned {i+1} nodes, drop down"})
-                    break
-            else:
-                path.append({"level": f"Level {level_num}", "action": f"Scanned {len(lvl)} nodes, drop down"})
-        return False, comparisons, steps, path
-
-    def search_esl(esl_data, key):
-        """ESL search: binary search with range narrowing through COIL -> PDL -> Data."""
-        data = esl_data["data"]
-        pdl = esl_data["pdl"]
-        coil = esl_data["coil"]
-        comparisons = 0
-        steps = 0
-        path = []
-
-        if not data:
-            return False, 0, 0, [{"level": "Data", "action": "Empty", "hit": False}]
-
-        lo, hi = 0, len(data) - 1
-
-        # COIL narrowing (top-to-bottom; coil[0]=highest)
-        for level_idx, lvl in enumerate(coil):
-            level_num = len(coil) - 1 - level_idx
-            if not lvl:
-                continue
-            steps += 1
-            bs_comps = max(1, math.ceil(math.log2(max(len(lvl), 2))))
-            comparisons += bs_comps
-            idx = bisect.bisect_left(lvl, key)
-            if idx < len(lvl) and lvl[idx] == key:
-                path.append({"level": f"COIL L{level_num}", "action": f"HIT {key} ({bs_comps} comps)", "hit": True})
-                return True, comparisons, steps, path
-            if idx > 0:
-                lo = max(lo, bisect.bisect_left(data, lvl[idx - 1]))
-            if idx < len(lvl):
-                hi = min(hi, bisect.bisect_left(data, lvl[idx]))
-            path.append({"level": f"COIL L{level_num}", "action": f"Narrow [{lo},{hi}] ({bs_comps} comps)"})
-
-        # PDL narrowing
-        if pdl:
-            pdl_keys = [e["key"] for e in pdl]
-            steps += 1
-            bs_comps = max(1, math.ceil(math.log2(max(len(pdl_keys), 2))))
-            comparisons += bs_comps
-            idx = bisect.bisect_left(pdl_keys, key)
-            if idx < len(pdl_keys) and pdl_keys[idx] == key:
-                path.append({"level": "PDL", "action": f"HIT {key} ({bs_comps} comps)", "hit": True})
-                return True, comparisons, steps, path
-            if idx > 0:
-                lo = max(lo, bisect.bisect_left(data, pdl_keys[idx - 1]))
-            if idx < len(pdl_keys):
-                hi = min(hi, bisect.bisect_left(data, pdl_keys[idx]))
-            path.append({"level": "PDL", "action": f"Narrow [{lo},{hi}] ({bs_comps} comps)"})
-
-        # Data level (narrowed range)
-        sub = data[lo:hi + 1]
-        n = max(len(sub), 1)
-        bs_comps = max(1, math.ceil(math.log2(max(n, 2))))
-        comparisons += bs_comps
-        steps += 1
-        idx = bisect.bisect_left(sub, key)
-        if idx < len(sub) and sub[idx] == key:
-            path.append({"level": "Data", "action": f"Found at pos {lo + idx} ({bs_comps} comps)", "hit": True})
-            return True, comparisons, steps, path
-        path.append({"level": "Data", "action": f"Not found ({bs_comps} comps)"})
-        return False, comparisons, steps, path
-
     # ── Session State Initialization ──────────────────────
 
     if "struct_data" not in st.session_state:
@@ -456,6 +433,8 @@ elif page == "Structure Visualization":
             st.session_state.struct_mtime = os.path.getmtime("structure.json") if os.path.exists("structure.json") else 0
         except Exception:
             st.session_state.struct_mtime = 0
+    if "traverse_log" not in st.session_state:
+        st.session_state.traverse_log = _load_traverse_log()
 
     sd = st.session_state.struct_data
 
@@ -573,7 +552,17 @@ elif page == "Structure Visualization":
         _save_struct(sd)
         _save_oplog(st.session_state.op_log)
         st.success(f"Inserted **{insert_val}** - Traditional: {t_trad*1e6:.1f} us | ESL: {t_esl*1e6:.1f} us")
-
+        _ts = _dt.datetime.now().isoformat(timespec='seconds')
+        st.session_state.traverse_log["forward"].append({
+            "timestamp": _ts, "op": "INSERT", "key": insert_val,
+            "esl_path": [
+                "Data: bisect insert (O(log n) position, O(n) shift)",
+                "PDL: ~40% probabilistic promotion → position hint stored",
+                "COIL: hierarchical roll p=0.25/level, inserted into L0..Lmax"
+            ],
+            "trad_path": ["Level 0..max: bisect insert at each promoted level (p=0.25)"]
+        })
+        _save_traverse_log(st.session_state.traverse_log)
     # ── Handle Delete ─────────────────────────────────────
 
     if delete_btn:
@@ -600,7 +589,17 @@ elif page == "Structure Visualization":
             _save_struct(sd)
             _save_oplog(st.session_state.op_log)
             st.success(f"Deleted **{delete_val}** - Traditional: {t_trad*1e6:.1f} us | ESL: {t_esl*1e6:.1f} us")
-
+            _ts = _dt.datetime.now().isoformat(timespec='seconds')
+            st.session_state.traverse_log["backward"].append({
+                "timestamp": _ts, "op": "DELETE", "key": delete_val,
+                "esl_path": [
+                    "Data: remove key, shift tail, rebuild PDL positions",
+                    "PDL: filter out deleted key entry",
+                    "COIL L0..L3: scan and remove from each level"
+                ],
+                "trad_path": ["All levels: scan and remove key, trim empty top levels"]
+            })
+            _save_traverse_log(st.session_state.traverse_log)
     # ── Handle Search ─────────────────────────────────────
 
     if search_btn:
@@ -620,6 +619,13 @@ elif page == "Structure Visualization":
             "trad_comp": t_comp, "esl_comp": e_comp
         })
         _save_oplog(st.session_state.op_log)
+        _ts = _dt.datetime.now().isoformat(timespec='seconds')
+        st.session_state.traverse_log["forward"].append({
+            "timestamp": _ts, "op": "SEARCH", "key": search_val, "found": e_found,
+            "esl_path": [f"{p['level']}: {p['action']}" for p in e_path],
+            "trad_path": [f"{p['level']}: {p['action']}" for p in t_path]
+        })
+        _save_traverse_log(st.session_state.traverse_log)
 
         st.markdown("---")
         st.subheader("Search Results")
@@ -698,10 +704,10 @@ elif page == "Structure Visualization":
 
         max_display = 40
 
-        # COIL levels
+        # COIL levels — display from sparsest (highest index) to densest (L0)
         st.markdown("**COIL (Cache-Optimized Index Levels):**")
-        for idx, lvl in enumerate(coil):
-            level_num = len(coil) - 1 - idx
+        for level_num in range(len(coil) - 1, -1, -1):
+            lvl = coil[level_num]
             display = lvl[:max_display]
             suffix = f" ... (+{len(lvl)-max_display})" if len(lvl) > max_display else ""
             st.markdown(f"**COIL Level {level_num}** ({len(lvl)} entries)")
@@ -759,9 +765,9 @@ elif page == "Structure Visualization":
                 hovertemplate="Key: %{x}<extra>PDL Index</extra>"
             ))
 
-        # COIL levels at y=2,3,...
-        for idx, lvl in enumerate(reversed(coil)):
-            level_num = idx
+        # COIL levels at y=2,3,... — L0 (densest) at y=2, Ln-1 (sparsest) at top
+        for level_num in range(len(coil)):
+            lvl = coil[level_num]
             if lvl:
                 c_disp = lvl[:80]
                 fig.add_trace(go.Scatter(
@@ -824,95 +830,67 @@ elif page == "Structure Visualization":
 # ============================================================
 elif page == "Thread & BG Logs":
     st.title("Thread & Background Indexer Activity")
-    st.caption("For guide presentation - shows ESL BG thread design, stats, and operation history")
+    st.caption("Shows ESL lock-free architecture, index build stats, and live operation history")
+
+    # ── Ensure session state has traverse_log ──────────────
+    if "traverse_log" not in st.session_state:
+        st.session_state.traverse_log = _load_traverse_log()
+    if "op_log" not in st.session_state:
+        st.session_state.op_log = _load_oplog()
 
     # ── ROWEX model ───────────────────────────────────────
     st.subheader("ROWEX Concurrency Model")
     st.markdown("""
 | Thread | Role |
 |---|---|
-| **Main thread** | Handles insert/delete; pushes `{key, type}` to OpLog queue in O(1) |
-| **BG thread** | Drains OpLog asynchronously; builds COIL + PDL index structures |
-| **Readers** | Lock-free search after `waitForBG()` - no read locks needed (ROWEX) |
+| **Main thread** | Insert: O(1) CAS-push to lock-free Treiber stacks (Data + PDL). No mutex, no queue. |
+| **BG thread** | Waits idle until `waitForBG()` signals it to stop. Does not touch Data or PDL. |
+| **Readers** | Lock-free search on immutable snapshots after `waitForBG()` — no read locks (ROWEX) |
 
-> **waitForBG()** waits for opsProcessed == insertCount, then sorts all structures
-> in O(n log n) once. This is far cheaper than per-insert sortedInsert (O(n^2) total).
+> **waitForBG()** signals BG thread to exit, then builds sorted snapshots from the Treiber
+> stacks in O(n log n) once. COIL is built from the sorted Data snapshot in O(n) — already in
+> order so no extra sort needed. This is far cheaper than per-insert sorted insertion (O(n²)).
+
+**Insert hot path (zero mutex):**
+```
+dataList.push(key)        // CAS-prepend to Data Treiber stack — O(1)
+pdlList.push(key)         // CAS-prepend to PDL Treiber stack  — O(1), ~40% of keys
+insertCount.fetch_add(1)  // atomic increment                  — O(1)
+```
     """)
 
-    # ── BG worker code snippet ────────────────────────────
-    st.subheader("BG Worker - Source Code")
-    st.code("""\
-void bgWorker() {
-    while (!stopFlag) {
-        OpEntry entry;
-        {
-            unique_lock<mutex> lk(logMtx);
-            // wait up to 50us for work
-            logCV.wait_for(lk, chrono::microseconds(50),
-                [&]{ return !opLog.empty() || stopFlag.load(); });
-            if (!opLog.empty()) {
-                entry = opLog.front(); opLog.pop();
-                // track queue depth for stats
-                int qs = (int)opLog.size();
-                logSizeSum += qs; logSizeSamples++;
-                long long cur = logMaxSize.load();
-                while (qs > cur && !logMaxSize.compare_exchange_weak(cur, qs));
-            }
-        }
+    # ── Forward traversal logs — LIVE from session state ──
+    st.subheader("Forward Traversal Logs")
+    st.caption("Recorded from INSERT and SEARCH operations — forward path: COIL → PDL → Data")
+    _tlog = st.session_state.traverse_log  # live session state, not disk
+    _fwd_logs = _tlog.get("forward", [])
+    if _fwd_logs:
+        _fwd_rows = []
+        for _e in reversed(_fwd_logs[-100:]):
+            _fwd_rows.append({
+                "Timestamp":        _e.get("timestamp", ""),
+                "Op":               _e.get("op", ""),
+                "Key":              _e.get("key", ""),
+                "Found":            _e.get("found", "—"),
+                "ESL Path":         " → ".join(_e.get("esl_path", [])),
+                "Traditional Path": " → ".join(_e.get("trad_path", [])),
+            })
+        st.dataframe(pd.DataFrame(_fwd_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No forward logs yet. Use INSERT or SEARCH in the Structure Visualization tab.")
 
-        if (entry.type == 0) {           // INSERT
-            // PDL: ~40% sparse promotion - O(1) push_back
-            if (bgRng() % 5 < 2)
-                pdl.push_back({entry.key, 0});
-
-            // Hierarchical COIL (p=0.25 per level, like standard skiplist)
-            int maxLvl = -1;
-            for (int i = 0; i < COIL_LEVELS; i++) {
-                if ((int)(bgRng() % 4) == 0) maxLvl = i;
-                else break;
-            }
-            // Key in COIL L2 is guaranteed to also be in L0, L1
-            for (int i = 0; i <= maxLvl; i++)
-                coil[i].push_back(entry.key);
-        } else {                          // DELETE
-            pdlRemove(entry.key);
-            for (int i = 0; i < COIL_LEVELS; i++) sortedRemove(coil[i], entry.key);
-        }
-        opsProcessed++;  // signals waitForBG() that this item is done
-    }
-}
-
-void waitForBG() {
-    // Spin until BG has processed every queued insert
-    long long target = insertCount.load();
-    while (opsProcessed.load() < target) {
-        logCV.notify_one();
-        this_thread::sleep_for(chrono::microseconds(200));
-    }
-    // Sort all structures once - O(n log n) total
-    sort(data.begin(), data.end());
-    data.erase(unique(data.begin(), data.end()), data.end());
-    for (int i = 0; i < COIL_LEVELS; i++) {
-        sort(coil[i].begin(), coil[i].end());
-        coil[i].erase(unique(coil[i].begin(), coil[i].end()), coil[i].end());
-    }
-    sort(pdl.begin(), pdl.end(), [](auto& a, auto& b){ return a.key < b.key; });
-    rebuildPDLPositions(); // fixes data_pos references after sort
-}""", language="cpp")
-
-    # ── BG stats from benchmark ───────────────────────────
+    # BG stats from benchmark
     if bench and bench.get("experiments"):
-        st.subheader("BG Thread Stats per Scale")
+        st.subheader("Index Build Stats per Scale")
         stats_rows = []
         for exp in bench["experiments"]:
             e = exp["esl"]
             stats_rows.append({
                 "Scale": f"{exp['scale']:,}",
-                "BG Ops Processed": f"{e['bg_ops_processed']:,}",
-                "BG Efficiency (%)": f"{e['bg_efficiency']:.1f}",
-                "Queue Max Size": f"{e['queue_max_size']:,}",
-                "Queue Avg Size": f"{e['queue_avg_size']:.1f}",
+                "Inserts": f"{e['bg_ops_processed']:,}",
                 "Index Build Time (s)": f"{e.get('index_build_time', 0):.4f}",
+                "COIL Hit Rate (%)": f"{e['coil_hit_rate']:.1f}",
+                "COIL Levels": e.get('coil_levels', '—'),
                 "COIL Sizes": str(e.get("coil_sizes", [])),
                 "PDL Entries": f"{e['pdl_size']:,}",
             })
@@ -933,30 +911,25 @@ void waitForBG() {
                 fig.update_layout(title="Index Structure Sizes at 100K scale", height=300)
                 st.plotly_chart(fig, use_container_width=True)
 
-    # ── Search path explanation ───────────────────────────
-    st.subheader("ESL Search Path (ROWEX lock-free)")
-    st.code("""\
-bool search(int key) {
-    int rangeLo = 0, rangeHi = INT_MAX;
+    # ── Backward traversal logs — LIVE from session state ─
+    st.subheader("Backward Traversal Logs")
+    st.caption("Recorded from DELETE operations — reverse removal path across all levels")
+    _bwd_logs = st.session_state.traverse_log.get("backward", [])
+    if _bwd_logs:
+        _bwd_rows = []
+        for _e in reversed(_bwd_logs[-100:]):
+            _bwd_rows.append({
+                "Timestamp":                _e.get("timestamp", ""),
+                "Op":                       _e.get("op", ""),
+                "Key":                      _e.get("key", ""),
+                "ESL Removal Path":         " → ".join(_e.get("esl_path", [])),
+                "Traditional Removal Path": " → ".join(_e.get("trad_path", [])),
+            })
+        st.dataframe(pd.DataFrame(_bwd_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No backward logs yet. DELETE values in the Structure Visualization tab.")
 
-    // COIL: sparsest to densest (L3 -> L0), binary search, narrows range
-    for (int i = COIL_LEVELS-1; i >= 0; i--) {
-        if (coil[i].empty()) continue;
-        auto it = lower_bound(coil[i], key, range=[rangeLo, rangeHi]);
-        if (*it == key) { coilHits++; return true; }   // early exit
-        rangeLo = *(it-1);  rangeHi = *it;             // narrow range
-    }
-    // PDL: binary search on sparse index within narrowed range
-    auto pit = lower_bound(pdl, key, range=[rangeLo, rangeHi]);
-    if (pit->key == key) return true;
-    rangeLo = (pit-1)->key;  rangeHi = pit->key;
-
-    // Data: final binary search on tiny remaining range
-    return binary_search(data[rangeLo..rangeHi], key);
-}
-// No locks - safe after waitForBG() under ROWEX protocol""", language="cpp")
-
-    # ── Real-time operation log ───────────────────────────
+    # Real-time operation log
     if st.session_state.get("op_log"):
         st.subheader("Real-Time Operation Log (from Structure Visualization tab)")
         log_df = pd.DataFrame(st.session_state.op_log)
@@ -969,3 +942,235 @@ bool search(int key) {
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Insert or search some values in the Structure Visualization tab to see the operation log here.")
+
+
+# ════════════════════════════════════════════════════════════
+# TAB 4 - Live Crypto Price Index (CoinGecko API + ESL)
+# ════════════════════════════════════════════════════════════
+elif page == "Practical API Demo":
+    import urllib.request as _urllib
+    import urllib.error as _urlerr
+
+    st.title("Live Crypto Price Index — ESL in Practice")
+    st.caption(
+        "Fetches real-time cryptocurrency prices from CoinGecko (free, no API key). "
+        "Prices are indexed into the ESL structure and Traditional Skiplist for instant lookup."
+    )
+
+    # ── Fetch helper ──────────────────────────────────────
+    _COINGECKO_URL = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&order=market_cap_desc&per_page=50&page=1"
+    )
+
+    def _fetch_coins():
+        """Fetch top-50 coins from CoinGecko. Returns list of dicts or None on error."""
+        try:
+            req = _urllib.Request(_COINGECKO_URL, headers={"User-Agent": "ESL-Demo/1.0"})
+            with _urllib.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as _e:
+            return None
+
+    # ── Session state ─────────────────────────────────────
+    if "cg_coins" not in st.session_state:
+        st.session_state.cg_coins = None
+    if "cg_esl" not in st.session_state:
+        st.session_state.cg_esl = {"coil": [[] for _ in range(NUM_COIL_LEVELS)], "pdl": [], "data": []}
+    if "cg_trad" not in st.session_state:
+        st.session_state.cg_trad = {"levels": [[]]}
+    if "cg_price_map" not in st.session_state:
+        st.session_state.cg_price_map = {}   # cents → [coin_name, ...]
+    if "cg_fetched_at" not in st.session_state:
+        st.session_state.cg_fetched_at = ""
+
+    # ── Fetch button ──────────────────────────────────────
+    fc1, fc2 = st.columns([1, 4])
+    with fc1:
+        fetch_btn = st.button("Fetch Live Prices", type="primary", use_container_width=True)
+    with fc2:
+        if st.session_state.cg_fetched_at:
+            st.caption(f"Last fetched: {st.session_state.cg_fetched_at}  |  "
+                       f"{len(st.session_state.cg_coins or [])} coins loaded  |  "
+                       f"ESL data: {len(st.session_state.cg_esl['data'])} keys")
+
+    if fetch_btn:
+        with st.spinner("Fetching prices from CoinGecko…"):
+            _coins = _fetch_coins()
+        if _coins is None:
+            st.error("Could not reach CoinGecko API. Check your internet connection and try again.")
+        else:
+            # Build ESL & Traditional from fresh data
+            # ESL Data layer stores: integer price key (price_cents = round(price_usd * 100))
+            # price_map stores full metadata: cents -> [{name, symbol, price_usd, change_24h, market_cap}]
+            _new_esl  = {"coil": [[] for _ in range(NUM_COIL_LEVELS)], "pdl": [], "data": []}
+            _new_trad = {"levels": [[]]}
+            _price_map = {}   # cents -> list of full coin dicts
+            for _c in _coins:
+                _raw = _c.get("current_price") or 0
+                _cents = max(1, round(_raw * 100))   # ESL key: integer cents
+                _new_esl  = insert_esl(_new_esl, _cents)
+                _new_trad["levels"] = insert_traditional(_new_trad["levels"], _cents)
+                _price_map.setdefault(_cents, []).append({
+                    "name":        _c.get("name", ""),
+                    "symbol":      _c.get("symbol", "").upper(),
+                    "price_usd":   _raw,
+                    "change_24h":  round(_c.get("price_change_percentage_24h") or 0, 2),
+                    "market_cap":  _c.get("market_cap", 0),
+                })
+            st.session_state.cg_coins      = _coins
+            st.session_state.cg_esl        = _new_esl
+            st.session_state.cg_trad       = _new_trad
+            st.session_state.cg_price_map  = _price_map
+            st.session_state.cg_fetched_at = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"Indexed {len(_coins)} coins into ESL and Traditional Skiplist.")
+
+    if not st.session_state.cg_coins:
+        st.info("Click **Fetch Live Prices** to load data from CoinGecko.")
+        st.stop()
+
+    _coins     = st.session_state.cg_coins
+    _cg_esl    = st.session_state.cg_esl
+    _cg_trad   = st.session_state.cg_trad
+    _price_map = st.session_state.cg_price_map
+
+    # ── What ESL stores — design callout ────────────────
+    st.markdown("""
+> **What each ESL node stores:**  
+> The ESL **Data Layer** holds one **integer key per coin** — `price_cents = round(price_usd × 100)`.  
+> For example, Bitcoin at $94,213.00 → key `9421300`.  
+> **PDL** entries add a `{key, data_pos}` position hint (~40% of keys promoted).  
+> **COIL** levels hold the same integer key at higher sparsity levels for fast range narrowing.  
+> Full coin metadata (name, symbol, 24h change, market cap) is kept in a **separate lookup map** keyed by cents — the ESL index stays pure integers for O(log n) binary search.
+    """)
+
+    # ── Live price table ──────────────────────────────────
+    st.markdown("---")
+    st.subheader("Live Coin Prices")
+    _rows = []
+    for _c in _coins:
+        _rows.append({
+            "Rank":       _c.get("market_cap_rank", ""),
+            "Coin":       _c.get("name", ""),
+            "Symbol":     _c.get("symbol", "").upper(),
+            "Price (USD)": f"${_c.get('current_price', 0):,.4f}",
+            "24h Change %": round(_c.get("price_change_percentage_24h") or 0, 2),
+            "Market Cap":  f"${_c.get('market_cap', 0):,.0f}",
+        })
+    _df = pd.DataFrame(_rows)
+    st.dataframe(_df, use_container_width=True, hide_index=True)
+
+    # ── ESL index state ───────────────────────────────────
+    st.markdown("---")
+    st.subheader("ESL Index State")
+    st.caption(
+        "Each key in the ESL Data Layer = `round(price_usd × 100)` (integer cents). "
+        "PDL entries = {key, data_pos}. COIL entries = same integer key at higher levels."
+    )
+    si1, si2, si3, si4 = st.columns(4)
+    si1.metric("Data Layer keys", len(_cg_esl["data"]))
+    si2.metric("PDL index entries", len(_cg_esl["pdl"]))
+    si3.metric("COIL L0 (densest)", len(_cg_esl["coil"][-1]))
+    si4.metric("COIL L3 (sparsest)", len(_cg_esl["coil"][0]))
+
+    _layer_names = [f"COIL L{len(_cg_esl['coil'])-1-i}" for i in range(len(_cg_esl["coil"]))] + ["PDL", "Data"]
+    _layer_sizes = [len(l) for l in _cg_esl["coil"]] + [len(_cg_esl["pdl"]), len(_cg_esl["data"])]
+    fig = go.Figure(data=[go.Bar(x=_layer_names, y=_layer_sizes, marker_color="#aaaaaa")])
+    fig.update_layout(title="ESL Layer Sizes (price keys indexed)", height=260,
+                      xaxis_title="Layer", yaxis_title="Keys")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── ESL node contents: sorted data keys with metadata ─
+    st.markdown("**ESL Data Layer — stored keys with resolved metadata**")
+    _node_rows = []
+    for _k in sorted(_price_map.keys()):
+        for _m in _price_map[_k]:
+            _node_rows.append({
+                "ESL Key (cents)": _k,
+                "Price (USD)":     f"${_m['price_usd']:,.4f}",
+                "Coin":            _m["name"],
+                "Symbol":          _m["symbol"],
+                "24h Change %":    _m["change_24h"],
+                "Market Cap":      f"${_m['market_cap']:,.0f}",
+            })
+    if _node_rows:
+        st.dataframe(pd.DataFrame(_node_rows), use_container_width=True, hide_index=True)
+
+    # ── Price search ──────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Search a Price in the ESL Index")
+    st.caption("Enter a USD price. It will be converted to integer cents and looked up in both structures.")
+
+    ps1, ps2, ps3 = st.columns([2, 1, 1])
+    with ps1:
+        _search_price = st.number_input("Price (USD)", min_value=0.01, max_value=500000.0,
+                                        step=0.01, value=float(_coins[0].get("current_price", 1.0) or 1.0),
+                                        format="%.4f")
+    with ps2:
+        # Quick-pick: pick a coin's exact price
+        _coin_names = [_c["name"] for _c in _coins]
+        _pick_coin  = st.selectbox("Quick-pick coin price", options=["—"] + _coin_names)
+    with ps3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        _search_btn = st.button("Search", type="primary", use_container_width=True)
+
+    if _pick_coin != "—":
+        _picked = next((_c for _c in _coins if _c["name"] == _pick_coin), None)
+        if _picked and _picked.get("current_price"):
+            _search_price = float(_picked["current_price"])
+
+    if _search_btn:
+        _key = max(1, round(_search_price * 100))
+        _t0  = _time.perf_counter()
+        _tf, _tc, _ts, _tp = search_traditional(_cg_trad["levels"], _key)
+        _t_trad = _time.perf_counter() - _t0
+        _t0  = _time.perf_counter()
+        _ef, _ec, _es, _ep = search_esl(_cg_esl, _key)
+        _t_esl = _time.perf_counter() - _t0
+
+        _matched = _price_map.get(_key, [])
+        _label   = f"${_search_price:,.4f}  →  ESL key {_key} cents"
+
+        st.markdown(f"**Query:** {_label}")
+        if _matched:
+            _names = ", ".join(_m["name"] for _m in _matched)
+            st.success(f"Found in ESL index — node key `{_key}` resolves to: **{_names}**")
+        else:
+            st.warning("Price not in index (no coin priced exactly here)")
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            _s = "FOUND" if _tf else "NOT FOUND"
+            st.markdown(f"**Traditional** — {_s} | {_tc} comparisons | {_ts} steps | {_t_trad*1e6:.2f} µs")
+            for _p in _tp:
+                st.markdown(f"{'✓' if _p.get('hit') else '›'} **{_p['level']}**: {_p['action']}")
+        with sc2:
+            _s = "FOUND" if _ef else "NOT FOUND"
+            st.markdown(f"**ESL** — {_s} | {_ec} comparisons | {_es} steps | {_t_esl*1e6:.2f} µs")
+            for _p in _ep:
+                st.markdown(f"{'✓' if _p.get('hit') else '›'} **{_p['level']}**: {_p['action']}")
+
+        if _tc > 0 and _ec > 0:
+            _r = _tc / _ec
+            if _r > 1:
+                st.success(f"ESL used **{_r:.1f}x fewer** comparisons than Traditional.")
+            elif _r < 1:
+                st.info(f"Traditional used **{1/_r:.1f}x fewer** comparisons (small dataset — ESL excels at scale).")
+
+    # ── Price bar chart ───────────────────────────────────
+    st.markdown("---")
+    st.subheader("Price Overview")
+    _top20 = _coins[:20]
+    fig = go.Figure(data=[go.Bar(
+        x=[_c["symbol"].upper() for _c in _top20],
+        y=[_c.get("current_price", 0) for _c in _top20],
+        marker_color="#aaaaaa",
+        hovertemplate="<b>%{x}</b><br>$%{y:,.4f}<extra></extra>"
+    )])
+    fig.update_layout(title="Top 20 Coins — Current Price (USD)", height=320,
+                      xaxis_title="Coin", yaxis_title="Price (USD)")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+    # ── Use-case scenario cards removed — replaced by live API above ──
+

@@ -47,8 +47,9 @@ The ROWEX (Read-Optimized Write-EXclusion) concurrency protocol used in the ESL 
 
 - **`waitForBG()` barrier**: After all inserts, the benchmark forces a full sort of COIL + PDL before measuring search latency. This replaces per-insert sorted insertion (O(n²)) with a single O(n log n) bulk sort, staying true to the paper's asynchronous spirit.
 - **Sorted-array PDL with `data_pos`**: Instead of a linked list, we store position references into the Data array so the search can directly narrow its binary-search range, combining the paper's PDL idea with a learned-index-style position hint.
-- **Streamlit real-time dashboard** (`app.py`): Not in the paper — our addition for interactive visualization and benchmarking at three scales.
-- **JSON state persistence** (`structure.json`, `op_log.json`): Allows the CLI visualizer (`visualize.cpp`) and the Streamlit UI to share state across processes.
+- **Streamlit real-time dashboard** (`app.py`): Not in the paper — our addition for interactive visualization and benchmarking at three scales. Comprises four tabs: Performance Comparison, Structure Visualization, Thread & BG Logs, and Practical API Demo.
+- **JSON state persistence** (`structure.json`, `op_log.json`, `traverse_logs.json`): Allows the CLI visualizer (`visualize.cpp`) and the Streamlit UI to share state across processes. `traverse_logs.json` stores forward traversal paths (INSERT/SEARCH: COIL → PDL → Data) and backward removal paths (DELETE) for every operation.
+- **Practical API Demo tab**: Loads a configurable dataset (500–10,000 records) into both structures and simulates real-world API scenarios — batch lookups with configurable hit rate, single key path tracing, and range queries — demonstrating ESL's advantage in practical use cases (leaderboards, product catalogs, session stores).
 
 ---
 
@@ -79,10 +80,11 @@ streamlit run app.py
 |---|---|
 | `benchmark.cpp` | Runs 100K / 1M / 10M ops benchmark; exports `benchmark_results.json` |
 | `visualize.cpp` | CLI: insert / search / delete / print / export `structure.json` |
-| `app.py` | Streamlit dashboard: performance charts + real-time structure visualization |
+| `app.py` | Streamlit dashboard: 4 tabs — Performance, Structure Visualization, Thread & BG Logs, Practical API Demo |
 | `benchmark_results.json` | Auto-generated benchmark data |
 | `structure.json` | Auto-generated structure snapshot |
 | `op_log.json` | Persisted operation log (survives browser refresh) |
+| `traverse_logs.json` | Persisted forward (INSERT/SEARCH) and backward (DELETE) traversal logs |
 
 ---
 

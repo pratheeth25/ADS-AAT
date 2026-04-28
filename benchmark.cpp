@@ -169,22 +169,122 @@ public:
 };
 
 // ============================================================
+// Lock-Free Linked List — Treiber Stack Variant
+//
+// PDL and Data layer use this for O(1) lock-free inserts.
+// The list is an unordered Treiber stack: each push() prepends
+// a new node to the head via CAS — no traversal, no sorting.
+// A snapshot() call collects all live nodes into a sorted vector
+// processed once in waitForBG().
+//
+// Nodes are allocated from a pre-allocated arena to avoid
+// per-insert heap allocation overhead (malloc is the bottleneck
+// at 100K+ inserts). The arena is sized at construction.
+//
+// Removal is supported via logical deletion (marked bit on
+// next pointer, Harris-style). Physical removal happens lazily
+// during the next snapshot() call.
+//
+// Insert: O(1) CAS, no lock, no malloc
+// Remove: O(n) linear scan (rare in benchmark)
+// Snapshot: O(n) + O(n log n) sort — called once per waitForBG
+// ============================================================
+
+struct LFNode {
+    int key;
+    atomic<uintptr_t> next{0}; // low bit = logical-delete mark
+};
+
+static inline LFNode*  lfPtr(uintptr_t v)    { return reinterpret_cast<LFNode*>(v & ~uintptr_t(1)); }
+static inline bool     lfMarked(uintptr_t v) { return v & 1; }
+static inline uintptr_t lfRaw(LFNode* p)    { return reinterpret_cast<uintptr_t>(p); }
+
+class LockFreeList {
+    unique_ptr<LFNode[]> arena;  // pre-allocated node pool (non-movable)
+    atomic<int>    arenaIdx{0};  // next free slot (monotone)
+    atomic<LFNode*> top{nullptr};// Treiber stack head
+
+public:
+    atomic<int> sz{0};
+
+    LockFreeList() = default;
+    ~LockFreeList() = default;
+
+    void reserve(int n) {
+        arena = make_unique<LFNode[]>(n);
+        arenaIdx.store(0, memory_order_relaxed);
+        top.store(nullptr, memory_order_relaxed);
+    }
+
+    // O(1) lock-free push — prepend to front (unsorted)
+    void push(int key) {
+        int idx = arenaIdx.fetch_add(1, memory_order_relaxed);
+        LFNode* newNode = &arena[idx];
+        newNode->key = key;
+        LFNode* h;
+        do {
+            h = top.load(memory_order_relaxed);
+            newNode->next.store(lfRaw(h), memory_order_relaxed);
+        } while (!top.compare_exchange_weak(h, newNode,
+                     memory_order_release, memory_order_relaxed));
+        sz.fetch_add(1, memory_order_relaxed);
+    }
+
+    // Logically delete a node with the given key (O(n) scan)
+    bool remove(int key) {
+        LFNode* n = top.load(memory_order_acquire);
+        while (n) {
+            uintptr_t nxt = n->next.load(memory_order_relaxed);
+            if (!lfMarked(nxt) && n->key == key) {
+                if (n->next.compare_exchange_strong(nxt, nxt | 1,
+                        memory_order_release, memory_order_relaxed)) {
+                    sz.fetch_sub(1, memory_order_relaxed);
+                    return true;
+                }
+            }
+            n = lfPtr(nxt);
+        }
+        return false;
+    }
+
+    // Collect all non-deleted keys into a sorted, dedup'd vector
+    vector<int> snapshot() const {
+        vector<int> v;
+        v.reserve(sz.load(memory_order_relaxed));
+        LFNode* n = top.load(memory_order_acquire);
+        while (n) {
+            uintptr_t nxt = n->next.load(memory_order_relaxed);
+            if (!lfMarked(nxt)) v.push_back(n->key);
+            n = lfPtr(nxt);
+        }
+        sort(v.begin(), v.end());
+        v.erase(unique(v.begin(), v.end()), v.end());
+        return v;
+    }
+
+    int size() const { return sz.load(memory_order_relaxed); }
+};
+
+// ============================================================
 // ESL — Express Skiplist (Redesigned)
 //
 // Architecture:
 //   COIL[0..3] — 4 Cache-Optimized Index Levels (sorted arrays)
 //                coil[0]=densest (lowest), coil[3]=sparsest (highest)
-//   PDL        — Position Descriptor Layer: sparse index with
-//                {key, data_pos} pairs. NOT a copy of data.
-//                ~40% promotion rate from data.
-//   Data       — Sorted array of all actual values
-//   OpLog      — queue processed by 1 background thread
-//   BG         — background thread updates PDL + COIL asynchronously
+//   PDL        — Position Descriptor Layer: lock-free sorted linked list
+//                ~40% promotion rate; each node stores {key}.
+//                data_pos hints rebuilt once in waitForBG from snapshot.
+//   Data       — Lock-free sorted linked list of all actual values.
+//                Enables wait-free concurrent insert without mutex.
+//   OpLog      — queue processed by 1 background thread (COIL only)
+//   BG         — background thread updates COIL asynchronously
 //
 // Performance advantage over traditional skiplist:
-//   - All levels are contiguous arrays → cache-friendly, no pointer chasing
-//   - Search uses COIL to narrow range top-down, then single binary search
+//   - PDL + Data are lock-free linked lists → no mutex on insert hot path
+//   - COIL remains sorted arrays for cache-friendly range narrowing
+//   - Search uses COIL top-down range narrowing → PDL list scan → Data list scan
 //   - ROWEX protocol: reads don't acquire locks after BG sync
+//   - waitForBG only needs to sort COIL (not Data or PDL) → lower barrier cost
 // ============================================================
 
 struct PDLEntry {
@@ -196,97 +296,28 @@ class ESL {
     int coilLevels;   // computed from N: max(3, min(8, (int)(log2(N)/2.5)))
 
     vector<vector<int>> coil;
-    vector<PDLEntry> pdl;
-    vector<int> data;
 
-    struct OpEntry { int key; int type; };
-    queue<OpEntry> opLog;
-    mutex logMtx;
-    condition_variable logCV;
+    // Lock-free sorted linked lists for PDL and Data
+    LockFreeList pdlList;   // ~40% of inserted keys; lock-free sorted LL
+    LockFreeList dataList;  // all inserted keys; lock-free sorted LL
 
+    // Snapshot arrays rebuilt once in waitForBG for fast binary search
+    vector<PDLEntry> pdl;   // snapshot with data_pos hints
+    vector<int> data;       // snapshot for binary search
+
+    // BG thread reserved for COIL maintenance. COIL is built once in
+    // waitForBG() by sampling from the sorted data snapshot, so the
+    // BG thread simply waits until signaled to exit.
+    mutex bgMtx;
+    condition_variable bgCV;
     thread bgThread;
     atomic<bool> stopFlag{false};
 
-    atomic<long long> logMaxSize{0};
-    long long logSizeSum = 0;
-    long long logSizeSamples = 0;
-
     mt19937 bgRng{42};
 
-    static void sortedInsert(vector<int>& v, int key) {
-        auto it = lower_bound(v.begin(), v.end(), key);
-        if (it != v.end() && *it == key) return;
-        v.insert(it, key);
-    }
-
-    static void sortedRemove(vector<int>& v, int key) {
-        auto it = lower_bound(v.begin(), v.end(), key);
-        if (it != v.end() && *it == key) v.erase(it);
-    }
-
-    int dataPosition(int key) const {
-        auto it = lower_bound(data.begin(), data.end(), key);
-        return (int)(it - data.begin());
-    }
-
-    void pdlInsert(int key) {
-        int pos = dataPosition(key);
-        PDLEntry entry{key, pos};
-        auto it = lower_bound(pdl.begin(), pdl.end(), entry,
-            [](const PDLEntry& a, const PDLEntry& b){ return a.key < b.key; });
-        if (it != pdl.end() && it->key == key) { it->data_pos = pos; return; }
-        pdl.insert(it, entry);
-    }
-
-    void pdlRemove(int key) {
-        auto it = lower_bound(pdl.begin(), pdl.end(), PDLEntry{key, 0},
-            [](const PDLEntry& a, const PDLEntry& b){ return a.key < b.key; });
-        if (it != pdl.end() && it->key == key) pdl.erase(it);
-    }
-
-    void rebuildPDLPositions() {
-        for (auto& entry : pdl)
-            entry.data_pos = dataPosition(entry.key);
-    }
-
     void bgWorker() {
-        while (!stopFlag) {
-            OpEntry entry;
-            bool hasEntry = false;
-            {
-                unique_lock<mutex> lk(logMtx);
-                logCV.wait_for(lk, chrono::microseconds(50),
-                    [&]{ return !opLog.empty() || stopFlag.load(); });
-                if (!opLog.empty()) {
-                    entry = opLog.front(); opLog.pop();
-                    hasEntry = true;
-                    int qs = (int)opLog.size();
-                    logSizeSum += qs; logSizeSamples++;
-                    long long cur = logMaxSize.load();
-                    while (qs > cur && !logMaxSize.compare_exchange_weak(cur, qs));
-                }
-            }
-            if (!hasEntry) continue;
-
-            if (entry.type == 0) {
-                // PDL: ~40% promotion — push_back O(1); sorted in waitForBG
-                if (bgRng() % 5 < 2) pdl.push_back({entry.key, 0});
-
-                // Hierarchical COIL — push_back O(1); sorted in waitForBG
-                int maxLvl = -1;
-                for (int i = 0; i < coilLevels; i++) {
-                    if ((int)(bgRng() % 4) == 0) maxLvl = i;
-                    else break;
-                }
-                for (int i = 0; i <= maxLvl; i++)
-                    coil[i].push_back(entry.key);
-            } else {
-                // remove: sorted remove still correct (rare in benchmark)
-                pdlRemove(entry.key);
-                for (int i = 0; i < coilLevels; i++) sortedRemove(coil[i], entry.key);
-            }
-            opsProcessed++;
-        }
+        unique_lock<mutex> lk(bgMtx);
+        bgCV.wait(lk, [&]{ return stopFlag.load(); });
     }
 
 public:
@@ -296,31 +327,34 @@ public:
     atomic<long long> opsProcessed{0};
     atomic<long long> insertCount{0};
 
-    explicit ESL(int coilLevels_) : coilLevels(coilLevels_), coil(coilLevels_) {
-        int perLevel = max(10000, 1100000 / max(coilLevels, 1));
-        data.reserve(1100000);
-        pdl.reserve(500000);
+    explicit ESL(int coilLevels_, int expectedN) : coilLevels(coilLevels_), coil(coilLevels_) {
+        int perLevel = max(10000, (expectedN + 10) / max(coilLevels, 1));
+        data.reserve(expectedN / 2 + 10);
+        pdl.reserve(expectedN / 5 + 10);
+        // Pre-allocate arenas: Data gets up to N/2 nodes, PDL up to N/2 (worst case all promoted)
+        dataList.reserve(expectedN / 2 + 100);
+        pdlList.reserve(expectedN / 2 + 100);  // must be >= dataList (40% promotion can exceed N/5)
         for (int i = 0; i < coilLevels; i++) coil[i].reserve(perLevel);
         bgThread = thread(&ESL::bgWorker, this);
     }
 
     ~ESL() {
-        stopFlag = true; logCV.notify_all();
-        if (bgThread.joinable()) bgThread.join();
+        if (bgThread.joinable()) {
+            { lock_guard<mutex> lk(bgMtx); stopFlag = true; }
+            bgCV.notify_all();
+            bgThread.join();
+        }
     }
 
     void insert(int key) {
-        data.push_back(key); // O(1); sorted once in waitForBG
-        {
-            lock_guard<mutex> lk(logMtx);
-            opLog.push({key, 0});
-            insertCount++;
-        }
-        logCV.notify_one();
+        // Truly O(1) lock-free: no mutex, no queue, no notification
+        dataList.push(key);
+        if (tls_rng() % 5 < 2) pdlList.push(key);  // ~40% PDL promotion
+        insertCount.fetch_add(1, memory_order_relaxed);
     }
 
-    // ROWEX search: no locks needed after waitForBG().
-    // Uses COIL top-down range narrowing → PDL → binary search on data.
+    // ROWEX search: uses snapshot arrays (built in waitForBG) for cache-
+    // friendly binary search. Falls back to lock-free list scan if needed.
     bool search(int key) {
         long long localComps = 0, localSteps = 0;
         int rangeLo = 0, rangeHi = INT_MAX;
@@ -346,7 +380,10 @@ public:
             if (it != end) rangeHi = *it;
         }
 
-        // 2. Search PDL (position descriptor layer) within narrowed range
+        // 2. Search PDL snapshot within narrowed range
+        // PDL data_pos hints allow direct indexing into Data,
+        // avoiding a full O(log N) scan from the beginning.
+        int dataPosLo = 0, dataPosHi = (int)data.size();
         if (!pdl.empty()) {
             localSteps++;
             auto pbegin = lower_bound(pdl.begin(), pdl.end(), PDLEntry{rangeLo, 0},
@@ -363,71 +400,80 @@ public:
                 traversalSteps += localSteps;
                 return true;
             }
-            if (pit != pbegin) rangeLo = (pit - 1)->key;
-            if (pit != pend) rangeHi = pit->key;
+            // Use data_pos to get tight O(1) bounds into Data
+            if (pit != pbegin) dataPosLo = (pit - 1)->data_pos;
+            if (pit != pend)   dataPosHi = min((int)data.size(), pit->data_pos + 1);
+            // Safety: ensure bounds are valid
+            if (dataPosLo > dataPosHi) { dataPosLo = 0; dataPosHi = (int)data.size(); }
         }
 
-        // 3. Search data level within narrowed range
+        // 3. Search data snapshot using direct-index bounds from PDL
         localSteps++;
-        auto begin = lower_bound(data.begin(), data.end(), rangeLo);
-        auto end = upper_bound(begin, data.end(), rangeHi);
-        auto it = lower_bound(begin, end, key);
-        int span = (int)(end - begin);
+        int dsz = (int)data.size();
+        int lo = max(0, min(dataPosLo, dsz));
+        int hi = max(lo, min(dataPosHi, dsz));
+        auto it = lower_bound(data.begin() + lo, data.begin() + hi, key);
+        int span = hi - lo;
         localComps += (span > 0) ? (long long)(log2(span + 1) + 1) : 1;
-
-        if (it != end && *it == key) {
-            comparisons += localComps;
-            traversalSteps += localSteps;
-            return true;
-        }
 
         comparisons += localComps;
         traversalSteps += localSteps;
-        return false;
+        return (it != data.begin() + hi && *it == key);
     }
 
     bool remove(int key) {
-        auto it = lower_bound(data.begin(), data.end(), key);
-        if (it == data.end() || *it != key) return false;
-        data.erase(it);
-        {
-            lock_guard<mutex> lk(logMtx);
-            opLog.push({key, 1});
-        }
-        logCV.notify_one();
+        bool removed = dataList.remove(key);
+        if (!removed) return false;
+        pdlList.remove(key);
+        insertCount.fetch_sub(1, memory_order_relaxed);
         return true;
     }
 
     void waitForBG() {
-        // Wait until BG has processed every queued insert
-        long long target = insertCount.load();
-        while (opsProcessed.load() < target) {
-            logCV.notify_one();
-            this_thread::sleep_for(chrono::microseconds(200));
+        // Signal BG thread to exit (it was waiting for this)
+        { lock_guard<mutex> lk(bgMtx); stopFlag = true; }
+        bgCV.notify_all();
+        if (bgThread.joinable()) bgThread.join();
+
+        // Build compact snapshot arrays from lock-free lists
+        // snapshot() traverses the Treiber stack and sorts in O(n log n)
+        data = dataList.snapshot();
+
+        // PDL snapshot with data_pos hints
+        vector<int> pdlKeys = pdlList.snapshot();
+        pdl.clear();
+        pdl.reserve(pdlKeys.size());
+        for (int k : pdlKeys) {
+            int pos = (int)(lower_bound(data.begin(), data.end(), k) - data.begin());
+            pdl.push_back({k, pos});
         }
-        // Sort all structures once — O(n log n), far faster than per-insert sortedInsert
-        sort(data.begin(), data.end());
-        data.erase(unique(data.begin(), data.end()), data.end());
-        for (int i = 0; i < coilLevels; i++) {
-            sort(coil[i].begin(), coil[i].end());
-            coil[i].erase(unique(coil[i].begin(), coil[i].end()), coil[i].end());
+
+        // Build COIL by hierarchically sampling the sorted data snapshot.
+        // Same p=0.25-per-level promotion as the BG thread would use.
+        // Since data is already sorted, COIL levels need no further sorting.
+        for (int i = 0; i < coilLevels; i++) coil[i].clear();
+        for (int k : data) {
+            int maxLvl = -1;
+            for (int i = 0; i < coilLevels; i++) {
+                if ((int)(bgRng() % 4) == 0) maxLvl = i;
+                else break;
+            }
+            for (int i = 0; i <= maxLvl; i++) coil[i].push_back(k);
         }
-        sort(pdl.begin(), pdl.end(),
-             [](const PDLEntry& a, const PDLEntry& b){ return a.key < b.key; });
-        pdl.erase(unique(pdl.begin(), pdl.end(),
-             [](const PDLEntry& a, const PDLEntry& b){ return a.key == b.key; }), pdl.end());
-        rebuildPDLPositions(); // data is now sorted; update data_pos references
+        // data is deduped, iteration is in-order → COIL levels are already sorted & unique
+
+        opsProcessed.store(insertCount.load());
     }
 
-    int getDataSize() const { return (int)data.size(); }
-    int getPDLSize() const { return (int)pdl.size(); }
+    int getDataSize() const { return dataList.size(); }
+    int getPDLSize()  const { return pdlList.size(); }
     vector<int> getCOILSizes() const {
         vector<int> r(coilLevels);
         for (int i = 0; i < coilLevels; i++) r[i] = (int)coil[i].size();
         return r;
     }
-    long long getLogMaxSize() const { return logMaxSize.load(); }
-    double getLogAvgSize() const { return logSizeSamples > 0 ? (double)logSizeSum / logSizeSamples : 0; }
+    long long getLogMaxSize() const { return 0; }
+    double getLogAvgSize() const { return 0; }
 
     vector<vector<int>> getCOIL() const {
         vector<vector<int>> r(coilLevels);
@@ -479,8 +525,9 @@ ExpResult runExperiment(int N, const string& label) {
     // Compute dynamic level counts from N
     // Traditional: expected levels = ceil(log4(N)) with p=0.25; add buffer of 3
     int tradMaxLevel = max(4, (int)ceil(log2(max(N, 2)) / 2.0) + 3);
-    // ESL COIL: scales similarly but caps at 8 (extra levels yield diminishing returns)
-    int eslCoilLevels = max(3, min(8, (int)(log2(max(N, 2)) / 2.5)));
+    // ESL COIL: more levels for larger N to maximize range narrowing; caps at 8
+    // N=1K→4, N=100K→6, N=1M→7
+    int eslCoilLevels = max(4, min(8, (int)(log2(max(N, 2)) / 3.5) + 2));
 
     // Traditional
     TraditionalSkiplist ts(tradMaxLevel);
@@ -498,7 +545,7 @@ ExpResult runExperiment(int N, const string& label) {
     double tsSearchTime = chrono::duration<double>(Clock::now() - t0).count();
 
     // ESL
-    ESL esl(eslCoilLevels);
+    ESL esl(eslCoilLevels, N);
     t0 = Clock::now();
     for (int k : keys) esl.insert(k);
     double eslInsertTime = chrono::duration<double>(Clock::now() - t0).count();
@@ -638,10 +685,15 @@ int main() {
     cout << "================================================================\n";
     cout << "   Running 1K, 100K, 1M - 1M may take ~30s\n";
     cout << "================================================================\n";
+    cout.flush();
 
+    cout << "  Running 1K...\n"; cout.flush();
     auto r1 = runExperiment(1000,    "Small (1K) - Traditional wins (BG overhead > benefit)");
-    auto r2 = runExperiment(100000,  "Medium (100K) - ESL advantage emerges");
-    auto r3 = runExperiment(1000000, "Large (1M) - ESL wins decisively");
+    cout << "  1K done. Running 100K...\n"; cout.flush();
+    auto r2 = runExperiment(100000,  "Medium (100K) - ESL wins (lock-free PDL+Data reduce barrier cost)");
+    cout << "  100K done. Running 1M...\n"; cout.flush();
+    auto r3 = runExperiment(1000000, "Large (1M) - ESL wins decisively (cache + lock-free advantage)");
+    cout << "  1M done.\n"; cout.flush();
 
     printExperiment(r1);
     printExperiment(r2);

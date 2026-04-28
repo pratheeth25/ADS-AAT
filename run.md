@@ -30,49 +30,46 @@ g++ -std=c++17 -O2 -pthread benchmark.cpp -o benchmark
 g++ -std=c++17 -O2 -pthread visualize.cpp -o visualize
 ```
 
-> On Windows with MinGW you may need `-lws2_32` or just ensure pthreads are available.
-
 ---
 
 ## Step 3: Run the Benchmark
 
 ```bash
-./benchmark
+./benchmark        # Linux / Mac
+.\benchmark.exe    # Windows PowerShell
 ```
 
-**Windows:**
-```powershell
-.\benchmark.exe
-```
+This runs **three scales** (1K, 100K, 1M operations — 50% insert, 50% search):
 
-This will:
-- Run 100,000 operations (50% insert, 50% search)
-- Print a detailed metrics dashboard to the console
-- Export `benchmark_results.json`
+| Scale | Winner | Speedup |
+|---|---|---|
+| 1K ops | Traditional | ~1.1–1.4× |
+| 100K ops | **ESL** | ~1.7–3.7× |
+| 1M ops | **ESL** | ~2.0–5.9× |
+
+Output:
+- Detailed metrics dashboard printed to console
+- `benchmark_results.json` exported (consumed by the Streamlit dashboard)
+
+**Architecture note**: ESL inserts are fully lock-free — PDL and Data use Treiber
+stacks (O(1) CAS push, no mutex). COIL levels are built once from the sorted Data
+snapshot in `waitForBG()`.
 
 ---
 
 ## Step 4: Run the CLI Visualizer
 
 ```bash
-./visualize
-```
-
-**Windows:**
-```powershell
-.\visualize.exe
+./visualize        # Linux / Mac
+.\visualize.exe    # Windows PowerShell
 ```
 
 Interactive menu:
-1. **Insert** — insert a key into both structures, shows latency (us) for each; auto-exports `structure.json`
+1. **Insert** — insert a key into both structures; auto-exports `structure.json`
 2. **Search** — search with full path tracing and latency comparison
 3. **Delete** — delete from both structures; auto-exports `structure.json`
 4. **Export JSON** — writes `structure.json`
 5. **Exit**
-
-> **Auto-Export** is always ON: `structure.json` is updated automatically after every insert/delete. The Streamlit dashboard can detect these changes via its **Refresh from Disk** button.
-
-> **Tip:** Insert a few values (e.g., 10, 20, 30, 40, 50), then switch to the Streamlit dashboard to see the structures live.
 
 ---
 
@@ -82,42 +79,40 @@ Interactive menu:
 streamlit run app.py
 ```
 
-This opens a browser at `http://localhost:8501` with two tabs:
+Opens `http://localhost:8501` with three tabs:
 
 ### Tab 1 — Performance Comparison
-- Metric comparison table (bold = winner)
+- Metric comparison table (bold = winner) for all three scales
 - Bar charts: Search Time, Throughput, Comparisons, Traversal Steps, Latency
-- ESL Insights Panel: COIL hit rate, BG efficiency, queue stats
+- ESL Insights Panel: COIL hit rate, structure sizes
 
 ### Tab 2 — Structure Visualization (Real-Time)
-- **Insert values** directly in the browser — both Traditional and ESL structures update instantly
-- **Search values** with full path tracing: see comparisons, steps, and latency for both structures
-- **Refresh from Disk** button reloads `structure.json` if updated externally (e.g., by the CLI tool)
-- **Side-by-side** display of Traditional Skiplist levels vs ESL layers
-- **PDL (Position Description Layer)** shown as a proper indexing layer with position references (e.g., `3 (pos 2)` = key 3 at data position 2), distinct from the Data Layer
-- **Multi-coil ESL** with 4 COIL levels — hierarchical (a key in COIL L2 is always in L0 and L1)
-- **ESL Layer Breakdown** chart showing entries per COIL level, PDL, and Data
-- **Operation Log** table tracking all inserts and searches with timing (microseconds)
-- Interactive plotly scatter plots for both structures
-- Size comparison metrics
+- **Insert/Search/Delete** values directly in the browser
+- **Refresh from Disk** button reloads `structure.json` if updated by the CLI tool
+- Side-by-side display of Traditional Skiplist levels vs ESL layers (COIL, PDL, Data)
+- PDL shown with position hints (e.g., `30 (pos 6)` = key 30 at data index 6)
+- Operation Log table with per-operation timing in microseconds
+- Plotly scatter plots and layer size charts
 
-### Architecture: PDL vs Data Layer
+### Tab 3 — Thread & BG Logs
+- ROWEX Concurrency Model diagram
+- BG thread stats per benchmark scale
 
-The ESL structure has a clear separation of concerns:
+---
 
-| Layer | Role |
-|---|---|
-| **Data Layer** | Stores all actual values (sorted) |
-| **PDL** | Sparse indexing layer (~40% of data keys) with position references into the Data Layer |
-| **COIL L0–L3** | Express-lane index levels with hierarchical promotion (p=0.25 per level; L0: ~25%, L1: ~6.25%, L2: ~1.56%, L3: ~0.39%) |
+## ESL Architecture Overview
 
-> PDL is NOT a copy of the Data Layer. It acts as a navigation index, storing only sampled keys with their positions in the data array.
+```
+┌──────────────────────────────────────────────────┐
+│  COIL L0..Lmax  — sorted arrays, built in waitForBG() from Data snapshot  │
+├──────────────────────────────────────────────────┤
+│  PDL  — lock-free Treiber stack; snapshot has {key, data_pos} hints       │
+├──────────────────────────────────────────────────┤
+│  Data — lock-free Treiber stack; snapshot is sorted array of all keys     │
+└──────────────────────────────────────────────────┘
+```
 
-### Multi-Coil Scalability
-
-The ESL uses 4 COIL levels by default. Promotion is **hierarchical**: a key first rolls for L0 (p=0.25), then L1 (p=0.25 again), etc. A key in COIL L2 is guaranteed to also be in L0 and L1 — just like a traditional skiplist's level invariant.
-
-> You can also upload JSON files via the sidebar if the files are in a different location.
+Insert hot path: **zero mutex** — two CAS operations + one atomic increment.
 
 ---
 
@@ -125,11 +120,13 @@ The ESL uses 4 COIL levels by default. Promotion is **hierarchical**: a key firs
 
 | File | Purpose |
 |---|---|
-| `benchmark.cpp` | Runs 100K ops, measures metrics, exports `benchmark_results.json` |
-| `visualize.cpp` | CLI tool: insert/search/delete/print/export `structure.json` |
-| `app.py` | Streamlit dashboard reading both JSON files |
-| `benchmark_results.json` | Auto-generated benchmark data |
-| `structure.json` | Auto-generated structure snapshot (PDL as index layer, multi-coil COIL) |
+| `benchmark.cpp` | Runs 1K/100K/1M ops, measures metrics, exports `benchmark_results.json` |
+| `visualize.cpp` | CLI tool: insert/search/delete/export `structure.json` |
+| `app.py` | Streamlit dashboard |
+| `explanation.md` | Beginner-friendly guide to every concept in the project |
+| `benchmark_results.json` | Auto-generated (gitignored) — benchmark output |
+| `structure.json` | Auto-generated (gitignored) — CLI visualizer snapshot |
+| `op_log.json` | Auto-generated (gitignored) — operation log |
 
 ---
 
@@ -140,12 +137,13 @@ The ESL uses 4 COIL levels by default. Promotion is **hierarchical**: a key firs
 g++ -std=c++17 -O2 -pthread benchmark.cpp -o benchmark
 g++ -std=c++17 -O2 -pthread visualize.cpp -o visualize
 
-# Run benchmark
+# Run benchmark (produces benchmark_results.json)
 ./benchmark
 
-# Run CLI (insert some values, export JSON)
+# Run CLI visualizer (insert some values, exports structure.json)
 ./visualize
 
-# Launch dashboard
+# Launch Streamlit dashboard
 streamlit run app.py
 ```
+

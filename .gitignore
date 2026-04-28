@@ -1,11 +1,26 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
 # Streamlit config
 .streamlit/
 
+# Compiled binaries
 *.exe
+*.o
+*.out
 
-*.json
+# Generated benchmark & visualizer output
+benchmark_results.json
+structure.json
+op_log.json
+traverse_logs.json
+
+# Temporary output files
+out*.txt
+
+# Debug / scratch artifacts
+*_debug*
+test_lf*
 
