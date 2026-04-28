@@ -123,11 +123,9 @@ ESL replaces the linked-list levels with three distinct components:
 │  COIL L1  (~6.25% of data)                              │  ← sorted array
 │  COIL L0  (~25% of data)                                │  ← sorted array
 ├─────────────────────────────────────────────────────────┤
-│  PDL      (~40% of data — sparse navigation index)      │  ← lock-free Treiber stack (insert O(1))
-│           each entry stores {key, data_pos}             │    snapshot sorted once at sync
+│  PDL      (~40% of data — sparse navigation index)      │  ← lock-free Linked List
 ├─────────────────────────────────────────────────────────┤
-│  Data     (100% — every value ever inserted)            │  ← lock-free Treiber stack (insert O(1))
-│                                                         │    snapshot sorted once at sync
+│  Data     (100% — every value ever inserted)            │  ← lock-free Linked List
 └─────────────────────────────────────────────────────────┘
 ```
 
