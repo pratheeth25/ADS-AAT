@@ -129,7 +129,7 @@ ESL replaces the linked-list levels with three distinct components:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**PDL and Data** use **lock-free Treiber stacks** for insertion: each `push()` is a
+**PDL and Data** use **lock-free linked lists** for insertion: each `push()` is a
 single CAS (compare-and-swap) operation — no mutex, no sorting, no waiting.
 Their sorted-array snapshots are built once in `waitForBG()`.
 
@@ -199,10 +199,10 @@ no cache misses.
 PDL stands for **Position Descriptor Layer**. It sits between COIL and the Data layer.
 About **40%** of all inserted keys are randomly promoted into the PDL.
 
-**PDL is implemented as a lock-free Treiber stack.** Each `insert()` call may push
-the key onto the PDL stack in O(1) time using a single CAS instruction — no locking,
+**PDL is implemented as a lock-free linked list.** Each `insert()` call may push
+the key onto the PDL list in O(1) time using a single CAS instruction — no locking,
 no sorting, no queue. The sorted snapshot used for search is built once during
-`waitForBG()` from the stack's contents.
+`waitForBG()` from the list's contents.
 
 But here is the key difference from the Data layer: **each PDL snapshot entry stores
 not just the key, but also its exact position (index) in the Data snapshot array**.
@@ -242,7 +242,7 @@ Every time you insert a key into ESL, updating COIL levels immediately would slo
 the insert — the sorted-array nature of COIL means every insertion would require
 shifting elements, which is O(n) per level.
 
-ESL's solution: **PDL and Data are lock-free Treiber stacks — inserts are O(1) CAS
+ESL's solution: **PDL and Data are lock-free linked lists — inserts are O(1) CAS
 operations with no mutex.** COIL construction is deferred to `waitForBG()`, where it
 is built once from the sorted Data snapshot in O(n) time.
 
@@ -250,7 +250,7 @@ is built once from the sorted Data snapshot in O(n) time.
 
 ```
 Foreground thread (insert):               waitForBG() (called once after all inserts):
-  1. CAS-push key onto Data stack (O(1))    1. Signal BG thread to exit
+  1. CAS-push key onto Data list (O(1))    1. Signal BG thread to exit
   2. CAS-push key onto PDL (40%, O(1))      2. Sort Data snapshot once → O(n log n)
   3. Increment atomic insertCount           3. Build PDL snapshot + data_pos hints
   4. Return immediately — no mutex!         4. Sample COIL levels from Data snapshot
@@ -299,7 +299,7 @@ destroying the performance benefit of having multiple threads.
 
 **ROWEX** stands for **Read-Optimized Write-EXclusion**.
 
-- **Insert**: uses lock-free CAS operations on the Treiber stacks — **zero mutex
+- **Insert**: uses lock-free CAS operations on the linked lists — **zero mutex
   operations** on the insert hot path. Every insert is a pure CAS + atomic increment.
 - **Search**: reads the COIL, PDL, and Data snapshots — all immutable arrays while
   searches run. **No locks acquired at all**.
@@ -323,7 +323,7 @@ This matters enormously in real databases: a single slow query can block many ot
 
 ### The problem
 
-PDL and Data are lock-free Treiber stacks — they accept inserts in any order. Before
+PDL and Data are lock-free linked lists — they accept inserts in any order. Before
 searches begin, ESL needs sorted, immutable snapshots of all three layers (Data, PDL,
 COIL) so that binary search works correctly.
 
@@ -336,7 +336,7 @@ void waitForBG() {
     // 1. Signal background thread to exit (it was waiting for this)
     stopFlag = true; bgCV.notify_all(); bgThread.join();
 
-    // 2. Build sorted Data snapshot from Treiber stack — O(n log n)
+    // 2. Build sorted Data snapshot from lock-free linked list — O(n log n)
     data = dataList.snapshot();   // traverses stack → sort → dedup
 
     // 3. Build sorted PDL snapshot + data_pos position hints — O(n log n + m)
@@ -380,7 +380,7 @@ than the foreground produces entries at typical insert rates.
 Your program                    ESL Instance
 ─────────────                   ─────────────────────────────────────
 main thread ───→ insert(42) ──→ Thread 1 (Foreground):
-                               │  CAS-push 42 onto Data stack   O(1)
+                               │  CAS-push 42 onto Data list    O(1)
                                │  CAS-push 42 onto PDL (~40%)   O(1)
                                │  atomic insertCount++           O(1)
                                │  return immediately
@@ -454,7 +454,7 @@ thread updating COIL/PDL while searches are happening simultaneously.
 ### What "inconsistency" means here
 
 When a new key `K` is inserted:
-1. It is immediately in the **Data layer** (Treiber stack push).
+1. It is immediately in the **Data layer** (lock-free linked list CAS-push).
 2. It is **not yet** in COIL or PDL — those are only updated by the background thread.
 
 So for a brief period, COIL/PDL are "stale" — they do not know about `K`.
@@ -690,7 +690,7 @@ and its pointer-chasing cost explodes. The crossover for **total time** is betwe
 At 1K ops, Traditional wins overall (1.28×), even though ESL's raw CAS-push insert
 is 6× faster. The reasons:
 
-1. **`waitForBG()` snapshot overhead**: Traversing the Treiber stack, sorting 500
+1. **`waitForBG()` snapshot overhead**: Traversing the lock-free linked list, sorting 500
    elements, building PDL position hints, and sampling COIL levels has a fixed baseline
    cost (~0.000394 s). At 1K ops this overhead is 84% of ESL's total insert+build time —
    it dwarfs the savings from lock-free insertion.
@@ -806,7 +806,7 @@ source code, and BG queue statistics from the last benchmark run.
 ```
 benchmark.cpp
 ├── TraditionalSkiplist class   — standard Pugh skiplist (linked-list nodes)
-├── LockFreeList class          — Treiber stack with pre-allocated arena
+├── LockFreeList class          — lock-free linked list with pre-allocated arena
 │   ├── arena[]                 — pre-allocated node pool (no per-insert malloc)
 │   ├── push()                  — O(1) lock-free CAS prepend
 │   ├── remove()                — O(n) logical deletion (mark bit on next ptr)

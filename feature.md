@@ -38,14 +38,14 @@ O(n) — keys are already in order so no extra sort is needed.
 sits — so the final binary search in Data can be confined to a tight window.
 
 **What is implemented:** About 40% of inserted keys are randomly promoted to PDL
-using a lock-free Treiber stack. The sorted PDL snapshot is built in `waitForBG()`
+using a lock-free linked list. The sorted PDL snapshot is built in `waitForBG()`
 and each entry stores `data_pos = bisect_left(data, key)`. The search path uses
 two adjacent PDL entries to set `[lo, hi]` bounds on the Data search. The Python
 dashboard visualization (`app.py`) also replicates this logic exactly.
 
 ---
 
-### ✅ Data Layer — lock-free Treiber stack
+### ✅ Data Layer — lock-free linked list
 
 **What the paper says:** All inserted keys go into a flat sorted layer. Insertion
 should be O(1) and lock-free.
@@ -53,12 +53,12 @@ should be O(1) and lock-free.
 **What is implemented:** `LockFreeList` uses a pre-allocated arena of `LFNode` structs
 (sized `expectedN/2 + 100` to prevent overflow). `push()` is a single CAS prepend
 — no mutex, no sorted insertion, no memory allocation per insert. The sorted snapshot
-is built once in `waitForBG()` via `snapshot()` which traverses the stack, collects
+is built once in `waitForBG()` via `snapshot()` which traverses the list, collects
 live (non-logically-deleted) nodes, sorts, and deduplicates.
 
 ---
 
-### ✅ PDL Layer — lock-free Treiber stack
+### ✅ PDL Layer — lock-free linked list
 
 **What the paper says:** PDL entries should be insertable lock-free.
 
@@ -253,7 +253,7 @@ physically remove it lazily during the next traversal.
 
 **What is implemented:** `LockFreeList::remove()` walks the stack and sets the
 low-bit mark on matching nodes. The `snapshot()` method skips logically-deleted nodes.
-This is Harris-style logical deletion applied to the Treiber stack.
+This is Harris-style logical deletion applied to the lock-free linked list.
 
 **What is NOT implemented:** `remove()` is O(n) (linear scan of the stack). The paper's
 lock-free delete is O(1) for the logical mark but may require helping and retrying for
@@ -265,9 +265,9 @@ the O(n) `remove()` directly without a background cleanup thread.
 
 ### ❌ Background delete compaction
 
-**What the paper says:** Physical removal of logically-deleted nodes from the Treiber
-stack should happen lazily in the background to avoid O(n) compaction on the critical
-path.
+**What the paper says:** Physical removal of logically-deleted nodes from the lock-free
+linked list should happen lazily in the background to avoid O(n) compaction on the
+critical path.
 
 **Why not implemented:** The benchmark workload is 50% insert + 50% search; deletes
 are not benchmarked. Background compaction adds significant complexity (safe memory
@@ -333,8 +333,8 @@ Not implemented.
 |---|---|---|
 | COIL sorted-array levels | ✅ | Fully implemented |
 | PDL with `data_pos` hints | ✅ | Fully implemented |
-| Data Layer — Treiber stack | ✅ | CAS-push, arena-allocated |
-| PDL Layer — Treiber stack | ✅ | CAS-push, arena-allocated |
+| Data Layer — lock-free linked list | ✅ | CAS-push, arena-allocated |
+| PDL Layer — lock-free linked list | ✅ | CAS-push, arena-allocated |
 | Arena allocation (no per-insert malloc) | ✅ | `expectedN/2 + 100` per list |
 | COIL → PDL → Data hierarchical search | ✅ | Full range-narrowing path |
 | Dynamic COIL level count | ✅ | log2-based formula |

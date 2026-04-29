@@ -43,17 +43,15 @@ This runs **three scales** (1K, 100K, 1M operations — 50% insert, 50% search):
 
 | Scale | Winner | Speedup |
 |---|---|---|
-| 1K ops | Traditional | ~1.1–1.4× |
-| 100K ops | **ESL** | ~1.7–3.7× |
-| 1M ops | **ESL** | ~2.0–5.9× |
+| 1K ops | Traditional | ~1.28× |
+| 100K ops | Traditional (insert) / ESL (insert-only) | Traditional wins total by ~1.11× |
+| 1M ops | **ESL** | ~1.65× |
 
 Output:
 - Detailed metrics dashboard printed to console
 - `benchmark_results.json` exported (consumed by the Streamlit dashboard)
 
-**Architecture note**: ESL inserts are fully lock-free — PDL and Data use Treiber
-stacks (O(1) CAS push, no mutex). COIL levels are built once from the sorted Data
-snapshot in `waitForBG()`.
+**Architecture note**: ESL inserts are fully lock-free — PDL and Data use lock-free linked lists (O(1) CAS push, no mutex). COIL levels are built once from the sorted Data snapshot in `waitForBG()`. The background thread waits idle and exits cleanly when `waitForBG()` is called.
 
 ---
 
@@ -106,9 +104,9 @@ Opens `http://localhost:8501` with three tabs:
 ┌──────────────────────────────────────────────────┐
 │  COIL L0..Lmax  — sorted arrays, built in waitForBG() from Data snapshot  │
 ├──────────────────────────────────────────────────┤
-│  PDL  — lock-free Treiber stack; snapshot has {key, data_pos} hints       │
+│  PDL  — lock-free linked list; snapshot has {key, data_pos} hints         │
 ├──────────────────────────────────────────────────┤
-│  Data — lock-free Treiber stack; snapshot is sorted array of all keys     │
+│  Data — lock-free linked list; snapshot is sorted array of all keys       │
 └──────────────────────────────────────────────────┘
 ```
 
